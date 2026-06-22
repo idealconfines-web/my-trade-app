@@ -63,18 +63,51 @@ def fetch_futures_data():
     except Exception as e:
         return 0, 0, 0
 
-# 定義抓取選擇權資料的函式
+# 定義抓取選擇權資料的函式 (真實爬取版：動態運算最大 OI)
 @st.cache_data(ttl=3600)
 def fetch_options_data():
+    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        # 模擬從期交所/財經網站解析出的當日最大 OI 數據
-        call_max_strike = 23600
-        call_max_oi = "18,500口 (+2,100)"
-        put_max_strike = 22800
-        put_max_oi = "22,000口 (+3,400)"
-        return call_max_strike, call_max_oi, put_max_strike, put_max_oi
-    except:
-        return 23500, "15,000口", 22500, "18,000口"
+        response = requests.get(url, headers=headers)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        rows = soup.find_all('tr')
+        calls = []
+        puts = []
+        current_strike = 0
+        
+        for row in rows:
+            tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
+            if not tds:
+                continue
+                
+            # 鎖定履約價欄位 (鎖定萬點以上的數字)
+            for text in tds:
+                if text.isdigit() and 10000 <= int(text) <= 40000:
+                    current_strike = int(text)
+                    break
+                    
+            # 根據買權/賣權的欄位位置，精準定位「未平倉量」(固定在後方第 9 格)
+            if '買權' in tds:
+                idx = tds.index('買權')
+                if len(tds) > idx + 9 and tds[idx + 9].isdigit():
+                    calls.append((current_strike, int(tds[idx + 9])))
+            elif '賣權' in tds:
+                idx = tds.index('賣權')
+                if len(tds) > idx + 9 and tds[idx + 9].isdigit():
+                    puts.append((current_strike, int(tds[idx + 9])))
+        
+        if calls and puts:
+            # 透過程式自動排序，找出 Call 與 Put 未平倉量最大的履約價
+            max_call = max(calls, key=lambda x: x[1])
+            max_put = max(puts, key=lambda x: x[1])
+            return str(max_call[0]), f"{max_call[1]:,} 口", str(max_put[0]), f"{max_put[1]:,} 口"
+            
+        return "---", "0 口", "---", "0 口"
+    except Exception as e:
+        return "資料讀取失敗", "0 口", "資料讀取失敗", "0 口"
 
 # 執行自動抓取
 with st.spinner("正在連線期交所更新最新籌碼..."):

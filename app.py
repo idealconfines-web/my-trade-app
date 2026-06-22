@@ -4,8 +4,6 @@ import requests
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 import datetime
-import csv
-from io import StringIO
 
 # 設定網頁標題與手機優化排版
 st.set_page_config(page_title="期權籌碼自動化儀表板", layout="centered", initial_sidebar_state="collapsed")
@@ -77,10 +75,10 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極殺手鐧 + 強制過濾無效零口數合約
+# 終極簡單粗暴版：不依賴絕對欄位位置，靠字串錨點定位
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
-    url = "https://www.taifex.com.tw/cht/3/optDataDown"
+    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         current_date = get_tw_time()
@@ -91,49 +89,49 @@ def fetch_top3_options_data():
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
                 payload = {
-                    'down_type': '1',
+                    'queryType': '2',
+                    'marketCode': '0',
                     'commodity_id': 'TXO',
-                    'queryStartDate': date_str,
-                    'queryEndDate': date_str
+                    'queryDate': date_str,
+                    'MarketCode': '0',
+                    'commodity_idt': 'TXO'
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
+                res.encoding = 'utf-8'
+                soup = BeautifulSoup(res.text, 'html.parser')
                 
-                try:
-                    text_data = res.content.decode('big5')
-                except:
-                    text_data = res.content.decode('utf-8', errors='ignore')
+                rows = soup.find_all('tr')
+                for row in rows:
+                    tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
+                    if not tds: continue
                     
-                if "交易日期" in text_data and "履約價" in text_data:
-                    reader = csv.DictReader(StringIO(text_data))
-                    for row in reader:
-                        try:
-                            strike, cp, oi = 0, '', 0
-                            for k, v in row.items():
-                                if not k or not v: continue
-                                k_str = str(k).strip()
-                                v_str = str(v).strip()
-                                
-                                if '履約價' in k_str:
-                                    strike = int(float(v_str))
-                                elif '買賣權' in k_str:
-                                    cp = v_str
-                                elif '未平倉' in k_str:  # 用更寬鬆的關鍵字比對
-                                    val = v_str.replace(',', '')
-                                    oi = 0 if val == '-' or not val else int(float(val))
-                                    
-                            # 🔥 核心防護：只收錄有真實 OI 堆積 (大於 0) 的合約
-                            if strike >= 10000 and oi > 0:
-                                if '買' in cp or 'Call' in cp:
-                                    calls.append((strike, oi))
-                                elif '賣' in cp or 'Put' in cp:
-                                    puts.append((strike, oi))
-                        except:
-                            pass
+                    # 尋找「買權」或「賣權」所在的格位
+                    cp_idx = -1
+                    for i, text in enumerate(tds):
+                        if '買權' in text or '賣權' in text or 'Call' in text or 'Put' in text:
+                            cp_idx = i
+                            break
                             
-                    if calls and puts:
-                        success = True
-                        break
+                    # 只要找到買賣權，前一格必為履約價，最後一格必為未平倉量
+                    if cp_idx >= 1:
+                        strike_text = tds[cp_idx - 1]
+                        oi_text = tds[-1]
                         
+                        if strike_text.isdigit():
+                            strike = int(strike_text)
+                            oi = 0 if oi_text == '-' or not oi_text else int(oi_text)
+                            
+                            # 過濾幽靈合約
+                            if strike >= 10000 and oi > 0:
+                                if '買' in tds[cp_idx] or 'Call' in tds[cp_idx]:
+                                    calls.append((strike, oi))
+                                else:
+                                    puts.append((strike, oi))
+                
+                if calls and puts:
+                    success = True
+                    break
+                    
             current_date -= datetime.timedelta(days=1)
             
         if success and calls and puts:

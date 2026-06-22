@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
-import plotly.graph_objects as go
 import datetime
+import plotly.graph_objects as go
+from bs4 import BeautifulSoup
 
 # 設定網頁標題與手機優化排版
 st.set_page_config(page_title="期權籌碼自動化儀表板", layout="centered", initial_sidebar_state="collapsed")
@@ -25,7 +25,6 @@ st.info("""
     * 核心守則：密切留意賣權 (Put) 的 **LL (下限區間)**，若伴隨最大量 OI 增長且未被實質跌破，往往是「情緒超跌」後的絕佳觀察點；向上挑戰 Call 最大壓力區時需防洗盤。
 """)
 
-# 核心修正 1：強制校正為台灣時間，防止雲端主機時差導致抓錯日期
 def get_tw_time():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
 
@@ -76,7 +75,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 核心修正 2：加入日期迴圈遞迴抓取，並強化數值萃取邏輯
+# 終極修正：直接使用 pandas 智慧解析表格，無視隱藏欄位與錯位問題
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
@@ -86,53 +85,72 @@ def fetch_top3_options_data():
         success = False
         calls, puts = [], []
         
-        # 往前搜尋直到找到有資料的營業日
         for _ in range(10):
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
-                payload = {'queryDate': date_str, 'commodity_id': 'TXO', 'MarketCode': '0'}
+                payload = {
+                    'queryType': '2',
+                    'marketCode': '0',
+                    'commodity_id': 'TXO',
+                    'queryDate': date_str,
+                    'MarketCode': '0',
+                    'commodity_idt': 'TXO'
+                }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
                 res.encoding = 'utf-8'
-                soup = BeautifulSoup(res.text, 'html.parser')
                 
-                rows = soup.find_all('tr')
-                
-                for row in rows:
-                    tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
-                    if len(tds) < 8: 
-                        continue
-                    
-                    is_call = '買權' in tds
-                    is_put = '賣權' in tds
-                    if not is_call and not is_put:
-                        continue
-                        
-                    current_strike = 0
-                    for text in tds:
-                        if text.isdigit() and 10000 <= int(text) <= 40000:
-                            current_strike = int(text)
+                try:
+                    tables = pd.read_html(res.text)
+                    df = None
+                    for t in tables:
+                        col_str = str(t.columns.tolist())
+                        if '履約價' in col_str and '買賣權' in col_str and '未平倉量' in col_str:
+                            df = t
                             break
                             
-                    if current_strike == 0:
-                        continue
+                    if df is not None and not df.empty:
+                        # 將複雜的雙層表頭壓平
+                        if isinstance(df.columns, pd.MultiIndex):
+                            df.columns = ['_'.join([str(c) for c in col]).strip() for col in df.columns]
+                        else:
+                            df.columns = [str(c).strip() for c in df.columns]
+                            
+                        # 動態抓取正確的欄位索引
+                        strike_c = next((c for c in df.columns if '履約價' in c), None)
+                        cp_c = next((c for c in df.columns if '買賣權' in c), None)
+                        oi_c = next((c for c in df.columns if '未平倉量' in c), None)
                         
-                    # 取出最後一欄的未平倉量，如果是 '-' 則視為 0
-                    oi_str = tds[-1]
-                    if oi_str == '-':
-                        oi_str = '0'
-                        
-                    if not oi_str.isdigit():
-                        continue
-                        
-                    if is_call:
-                        calls.append((current_strike, int(oi_str)))
-                    elif is_put:
-                        puts.append((current_strike, int(oi_str)))
-                
-                if calls and puts:
-                    success = True
-                    break
+                        if strike_c and cp_c and oi_c:
+                            for idx, row in df.iterrows():
+                                try:
+                                    strike_val = str(row[strike_c]).replace(',', '')
+                                    if not strike_val.replace('.', '').isdigit(): continue
+                                    strike = int(float(strike_val))
+                                    
+                                    cp_val = str(row[cp_c]).strip()
+                                    oi_val = str(row[oi_c]).replace(',', '').strip()
+                                    
+                                    if oi_val == '-' or not oi_val:
+                                        oi = 0
+                                    else:
+                                        oi = int(float(oi_val))
+                                        
+                                    if 10000 <= strike <= 40000:
+                                        if '買權' in cp_val or 'Call' in cp_val:
+                                            calls.append((strike, oi))
+                                        elif '賣權' in cp_val or 'Put' in cp_val:
+                                            puts.append((strike, oi))
+                                except:
+                                    pass
+                                    
+                            if calls and puts:
+                                success = True
+                                break
+                except:
+                    pass
                     
+            if success:
+                break
             current_date -= datetime.timedelta(days=1)
             
         if success and calls and puts:

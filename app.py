@@ -36,9 +36,8 @@ def fetch_5d_futures_data():
     current_date = datetime.datetime.now()
     days_checked = 0
     
-    # 往前推算，直到抓滿 5 個有資料的交易日 (避開假日)
     while len(records) < 5 and days_checked < 15:
-        if current_date.weekday() < 5:  # 0-4 代表週一至週五
+        if current_date.weekday() < 5: 
             date_str = current_date.strftime('%Y/%m/%d')
             date_display = current_date.strftime('%m/%d')
             try:
@@ -73,16 +72,24 @@ def fetch_5d_futures_data():
         current_date -= datetime.timedelta(days=1)
         days_checked += 1
         
-    # 將日期反轉為由舊到新
     return records[::-1]
 
-# 定義抓取選擇權前三大 OI 的函式
+# 定義抓取選擇權前三大 OI 的函式 (修正版：精準鎖定未平倉量)
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        response = requests.get(url, headers=headers)
+        # 改用 POST 請求並明確指定 TXO，防止期交所擋掉空白查詢
+        payload = {
+            'queryType': '2',
+            'marketCode': '0',
+            'commodity_id': 'TXO',
+            'queryDate': '',
+            'MarketCode': '0',
+            'commodity_idt': 'TXO'
+        }
+        response = requests.post(url, headers=headers, data=payload, timeout=5)
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -92,26 +99,40 @@ def fetch_top3_options_data():
         
         for row in rows:
             tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
-            if not tds: continue
+            if len(tds) < 10: 
+                continue
             
             for text in tds:
                 if text.isdigit() and 10000 <= int(text) <= 40000:
                     current_strike = int(text)
                     break
-                    
+            
+            # 期交所的「未平倉量」固定在表格的最後一格 (tds[-1])
+            oi_str = tds[-1]
+            if not oi_str.isdigit():
+                continue
+                
             if '買權' in tds:
-                idx = tds.index('買權')
-                if len(tds) > idx + 9 and tds[idx + 9].isdigit():
-                    calls.append((current_strike, int(tds[idx + 9])))
+                calls.append((current_strike, int(oi_str)))
             elif '賣權' in tds:
-                idx = tds.index('賣權')
-                if len(tds) > idx + 9 and tds[idx + 9].isdigit():
-                    puts.append((current_strike, int(tds[idx + 9])))
+                puts.append((current_strike, int(oi_str)))
         
         if calls and puts:
-            # 取出 OI 前三大的履約價，並依照履約價高低排序 (形成價格階梯)
-            top_calls = sorted(sorted(calls, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
-            top_puts = sorted(sorted(puts, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
+            # 針對相同的履約價可能有多個合約月份，我們先用 dict 整合出各履約價的最大 OI
+            call_dict = {}
+            put_dict = {}
+            for strike, oi in calls:
+                call_dict[strike] = max(call_dict.get(strike, 0), oi)
+            for strike, oi in puts:
+                put_dict[strike] = max(put_dict.get(strike, 0), oi)
+            
+            # 轉回 list 並排序取前三大
+            unique_calls = list(call_dict.items())
+            unique_puts = list(put_dict.items())
+            
+            top_calls = sorted(sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
+            top_puts = sorted(sorted(unique_puts, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
+            
             return top_calls, top_puts
             
         return [], []
@@ -128,13 +149,11 @@ if futures_records:
     df = pd.DataFrame(futures_records)
     latest = df.iloc[-1]
     
-    # 顯示最新一日數據
     col1, col2, col3 = st.columns(3)
     col1.metric(f"最新多單 ({latest['Date']})", f"{latest['Long']:,}")
     col2.metric(f"最新空單 ({latest['Date']})", f"{latest['Short']:,}")
     col3.metric("最新淨未平倉", f"{latest['Net']:,}", delta=int(latest['Net']))
 
-    # 繪製近五日淨未平倉走勢圖
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=df['Date'],
@@ -165,7 +184,6 @@ if top_calls and top_puts:
     
     html_str = '<div style="background-color: #1e293b; padding: 20px; border-radius: 15px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);">'
     
-    # 買權 (Call) 壓力區
     for strike, oi in top_calls:
         is_max = (oi == max_call_oi)
         color = "#fca5a5" if is_max else "#94a3b8"
@@ -181,7 +199,6 @@ if top_calls and top_puts:
         
     html_str += '<div style="text-align: center; color: #475569; margin: 15px 0; font-size: 0.8rem; letter-spacing: 2px;">▼ 結算震盪區間 ▲</div>'
     
-    # 賣權 (Put) 支撐區
     for strike, oi in top_puts:
         is_max = (oi == max_put_oi)
         color = "#86efac" if is_max else "#94a3b8"

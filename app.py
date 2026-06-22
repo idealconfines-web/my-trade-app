@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 import requests
-import datetime
-import plotly.graph_objects as go
 from bs4 import BeautifulSoup
+import plotly.graph_objects as go
+import datetime
+import csv
+from io import StringIO
 
 # 設定網頁標題與手機優化排版
 st.set_page_config(page_title="期權籌碼自動化儀表板", layout="centered", initial_sidebar_state="collapsed")
@@ -75,10 +77,10 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極修正：直接使用 pandas 智慧解析表格，無視隱藏欄位與錯位問題
+# 終極殺手鐧：直接呼叫期交所後端「CSV 下載 API」，完全跳過網頁表格解析！
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
-    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
+    url = "https://www.taifex.com.tw/cht/3/optDataDown"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         current_date = get_tw_time()
@@ -89,68 +91,47 @@ def fetch_top3_options_data():
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
                 payload = {
-                    'queryType': '2',
-                    'marketCode': '0',
+                    'down_type': '1',
                     'commodity_id': 'TXO',
-                    'queryDate': date_str,
-                    'MarketCode': '0',
-                    'commodity_idt': 'TXO'
+                    'queryStartDate': date_str,
+                    'queryEndDate': date_str
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
-                res.encoding = 'utf-8'
                 
+                # 嘗試解碼 (期交所 CSV 預設為 Big5)
                 try:
-                    tables = pd.read_html(res.text)
-                    df = None
-                    for t in tables:
-                        col_str = str(t.columns.tolist())
-                        if '履約價' in col_str and '買賣權' in col_str and '未平倉量' in col_str:
-                            df = t
-                            break
-                            
-                    if df is not None and not df.empty:
-                        # 將複雜的雙層表頭壓平
-                        if isinstance(df.columns, pd.MultiIndex):
-                            df.columns = ['_'.join([str(c) for c in col]).strip() for col in df.columns]
-                        else:
-                            df.columns = [str(c).strip() for c in df.columns]
-                            
-                        # 動態抓取正確的欄位索引
-                        strike_c = next((c for c in df.columns if '履約價' in c), None)
-                        cp_c = next((c for c in df.columns if '買賣權' in c), None)
-                        oi_c = next((c for c in df.columns if '未平倉量' in c), None)
-                        
-                        if strike_c and cp_c and oi_c:
-                            for idx, row in df.iterrows():
-                                try:
-                                    strike_val = str(row[strike_c]).replace(',', '')
-                                    if not strike_val.replace('.', '').isdigit(): continue
-                                    strike = int(float(strike_val))
-                                    
-                                    cp_val = str(row[cp_c]).strip()
-                                    oi_val = str(row[oi_c]).replace(',', '').strip()
-                                    
-                                    if oi_val == '-' or not oi_val:
-                                        oi = 0
-                                    else:
-                                        oi = int(float(oi_val))
-                                        
-                                    if 10000 <= strike <= 40000:
-                                        if '買權' in cp_val or 'Call' in cp_val:
-                                            calls.append((strike, oi))
-                                        elif '賣權' in cp_val or 'Put' in cp_val:
-                                            puts.append((strike, oi))
-                                except:
-                                    pass
-                                    
-                            if calls and puts:
-                                success = True
-                                break
+                    text_data = res.content.decode('big5')
                 except:
-                    pass
+                    text_data = res.content.decode('utf-8', errors='ignore')
                     
-            if success:
-                break
+                # 確認是否成功抓到 CSV 表頭
+                if "交易日期" in text_data and "履約價" in text_data:
+                    reader = csv.DictReader(StringIO(text_data))
+                    for row in reader:
+                        try:
+                            strike, cp, oi = 0, '', 0
+                            for k, v in row.items():
+                                if not k or not v: continue
+                                if '履約價' in k:
+                                    strike = int(float(v.strip()))
+                                elif '買賣權' in k:
+                                    cp = v.strip()
+                                elif '未平倉量' in k:
+                                    val = v.strip().replace(',', '')
+                                    oi = 0 if val == '-' else int(float(val))
+                                    
+                            if strike >= 10000:
+                                if '買' in cp or 'Call' in cp:
+                                    calls.append((strike, oi))
+                                elif '賣' in cp or 'Put' in cp:
+                                    puts.append((strike, oi))
+                        except:
+                            pass
+                            
+                    if calls and puts:
+                        success = True
+                        break
+                        
             current_date -= datetime.timedelta(days=1)
             
         if success and calls and puts:

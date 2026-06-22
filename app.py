@@ -19,9 +19,10 @@ st.markdown("""
 
 st.title("📊 台指期權籌碼自動化追蹤")
 
+# 策略備忘
 st.info("""
     **💡 SIP 策略備忘**
-    * 盤勢推演節奏：**情緒超跌 ➔ 理性回補 ➔ 中盤動盪**
+    * 盤勢推演節奏：**情緒超跌 -> 理性回補 -> 中盤動盪**
     * 核心守則：密切留意賣權 (Put) 的 **LL (下限區間)**，若伴隨最大量 OI 增長且未被實質跌破，往往是「情緒超跌」後的絕佳觀察點；向上挑戰 Call 最大壓力區時需防洗盤。
 """)
 
@@ -75,7 +76,6 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 智慧相對定位版：精準鎖定買賣權後方第 8 格的未平倉量
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
@@ -105,14 +105,12 @@ def fetch_top3_options_data():
                     tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
                     if not tds: continue
                     
-                    # 尋找「買權」或「賣權」所在的格位
                     cp_idx = -1
                     for i, text in enumerate(tds):
                         if '買權' in text or '賣權' in text or 'Call' in text or 'Put' in text:
                             cp_idx = i
                             break
                             
-                    # 核心邏輯：前一格是履約價，後方第 8 格是未平倉量
                     if cp_idx >= 1 and len(tds) > cp_idx + 8:
                         strike_text = tds[cp_idx - 1]
                         oi_text = tds[cp_idx + 8]
@@ -121,7 +119,6 @@ def fetch_top3_options_data():
                             strike = int(strike_text)
                             oi = 0 if oi_text == '-' or not oi_text or not oi_text.isdigit() else int(oi_text)
                             
-                            # 只收集真正有留倉口數堆積的部位
                             if strike >= 10000 and oi > 0:
                                 if '買' in tds[cp_idx] or 'Call' in tds[cp_idx]:
                                     calls.append((strike, oi))
@@ -145,7 +142,6 @@ def fetch_top3_options_data():
             unique_calls = list(call_dict.items())
             unique_puts = list(put_dict.items())
             
-            # 篩選出留倉口數前三大的密集堆積區，並依履約價高低排序成階梯圖
             top_calls = sorted(sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
             top_puts = sorted(sorted(unique_puts, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
             
@@ -159,6 +155,7 @@ with st.spinner("正在抓取期交所近五日籌碼與選擇權數據..."):
     futures_records = fetch_5d_futures_data()
     top_calls, top_puts = fetch_top3_options_data()
 
+# --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
 if futures_records:
     df = pd.DataFrame(futures_records)
@@ -190,47 +187,39 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-st.subheader("🎯 選擇權價格階梯 (前三大 OI)")
+# --- 區塊二：選擇權支撐壓力表 (改用原生表格) ---
+st.subheader("🎯 選擇權前三大支撐壓力表")
 
 if top_calls and top_puts:
-    max_call_oi = max(top_calls, key=lambda x: x[1])[1]
-    max_put_oi = max(top_puts, key=lambda x: x[1])[1]
+    # 將抓取到的資料轉為 Pandas DataFrame
+    call_data = []
+    for i, (strike, oi) in enumerate(top_calls):
+        label = "⚠️ 最大壓力" if i == 0 else "上檔壓力"
+        call_data.append({"屬性": label, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
     
-    html_str = '<div style="background-color: #1e293b; padding: 20px; border-radius: 15px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);">'
+    put_data = []
+    for i, (strike, oi) in enumerate(top_puts):
+        label = "🛡️ LL 防守" if i == 0 else "下檔支撐"
+        put_data.append({"屬性": label, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
+
+    df_call = pd.DataFrame(call_data)
+    df_put = pd.DataFrame(put_data)
+
+    # 左右分欄顯示
+    col_c, col_p = st.columns(2)
     
-    for strike, oi in top_calls:
-        is_max = (oi == max_call_oi)
-        color = "#fca5a5" if is_max else "#94a3b8"
-        weight = "bold" if is_max else "normal"
-        label = "⚠️ 最大壓力" if is_max else "上檔壓力"
-        html_str += f'''
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: {color}; font-weight: {weight};">
-            <span style="width: 30%; font-size: 0.9rem;">{label}</span>
-            <span style="width: 35%; text-align: center; font-size: 1.3rem;">{strike}</span>
-            <span style="width: 35%; text-align: right; font-size: 0.9rem;">{oi:,} 口</span>
-        </div>
-        '''
+    with col_c:
+        st.markdown("<h4 style='color: #fca5a5;'>🔴 買權 (Call) 區</h4>", unsafe_allow_html=True)
+        st.dataframe(df_call, hide_index=True, use_container_width=True)
         
-    html_str += '<div style="text-align: center; color: #475569; margin: 15px 0; font-size: 0.8rem; letter-spacing: 2px;">▼ 結算震盪區間 ▲</div>'
-    
-    for strike, oi in top_puts:
-        is_max = (oi == max_put_oi)
-        color = "#86efac" if is_max else "#94a3b8"
-        weight = "bold" if is_max else "normal"
-        label = "🛡️ LL 防守" if is_max else "下檔支撐"
-        html_str += f'''
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: {color}; font-weight: {weight};">
-            <span style="width: 30%; font-size: 0.9rem;">{label}</span>
-            <span style="width: 35%; text-align: center; font-size: 1.3rem;">{strike}</span>
-            <span style="width: 35%; text-align: right; font-size: 0.9rem;">{oi:,} 口</span>
-        </div>
-        '''
-        
-    html_str += '</div>'
-    st.markdown(html_str, unsafe_allow_html=True)
+    with col_p:
+        st.markdown("<h4 style='color: #86efac;'>🟢 賣權 (Put) 區</h4>", unsafe_allow_html=True)
+        st.dataframe(df_put, hide_index=True, use_container_width=True)
+
 else:
     st.warning("目前無法取得選擇權資料，請稍後重試。")
 
+st.markdown("---")
 if st.button("🔄 立即重新整理數據"):
     st.cache_data.clear()
     st.rerun()

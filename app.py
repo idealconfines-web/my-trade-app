@@ -81,7 +81,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極修正版：加回 oi > 0 條件，並打包所有主力合約供分頁使用
+# 終極修正版：用最寬鬆的欄位掃描法，保證抓到口數
 @st.cache_data(ttl=3600)
 def fetch_all_active_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
@@ -109,16 +109,26 @@ def fetch_all_active_options_data():
                     
                 if "交易日期" in text_data and "履約價" in text_data:
                     reader = csv.DictReader(StringIO(text_data))
-                    reader.fieldnames = [f.strip() for f in reader.fieldnames if f]
                     
                     for row in reader:
                         try:
-                            strike = int(float(row.get('履約價', 0)))
-                            cp = row.get('買賣權', '').strip()
-                            oi_str = row.get('未平倉量', '0').replace(',', '').strip()
-                            oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
-                            contract_month = row.get('到期月份(週別)', '').strip()
-                            
+                            strike, cp, oi, contract_month = 0, '', 0, ''
+                            # 採用最暴力的逐格掃描，無視隱藏空白字元
+                            for k, v in row.items():
+                                if not k or not v: continue
+                                k_str = str(k).strip()
+                                v_str = str(v).strip()
+                                
+                                if '履約價' in k_str:
+                                    strike = int(float(v_str))
+                                elif '買賣權' in k_str:
+                                    cp = v_str
+                                elif '未平倉' in k_str:  # 寬鬆比對
+                                    val = v_str.replace(',', '')
+                                    oi = 0 if val == '-' or not val else int(float(val))
+                                elif '到期' in k_str: # 寬鬆比對
+                                    contract_month = v_str
+                                    
                             # 🔥 裝回防護罩：必須要有留倉口數 (oi > 0) 才收錄！
                             if strike >= 10000 and oi > 0 and contract_month:
                                 if contract_month not in contracts_data:

@@ -7,7 +7,6 @@ import datetime
 import csv
 from io import StringIO
 
-# 設定網頁標題與手機優化排版
 st.set_page_config(page_title="期權籌碼自動化儀表板", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -24,7 +23,6 @@ st.markdown("""
 
 st.title("📊 台指期權籌碼自動化追蹤")
 
-# 策略備忘
 st.info("""
     **💡 SIP 策略備忘**
     * 盤勢推演節奏：**情緒超跌 ➔ 理性回補 ➔ 中盤動盪**
@@ -81,7 +79,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極修正版：用最寬鬆的欄位掃描法，保證抓到口數
+# 最堅固的解析法：直接鎖定陣列位置，無視多餘空白
 @st.cache_data(ttl=3600)
 def fetch_all_active_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
@@ -108,45 +106,48 @@ def fetch_all_active_options_data():
                     text_data = res.content.decode('utf-8', errors='ignore')
                     
                 if "交易日期" in text_data and "履約價" in text_data:
-                    reader = csv.DictReader(StringIO(text_data))
+                    lines = text_data.splitlines()
+                    reader = csv.reader(lines)
+                    header = next(reader, [])
                     
-                    for row in reader:
-                        try:
-                            strike, cp, oi, contract_month = 0, '', 0, ''
-                            # 採用最暴力的逐格掃描，無視隱藏空白字元
-                            for k, v in row.items():
-                                if not k or not v: continue
-                                k_str = str(k).strip()
-                                v_str = str(v).strip()
-                                
-                                if '履約價' in k_str:
-                                    strike = int(float(v_str))
-                                elif '買賣權' in k_str:
-                                    cp = v_str
-                                elif '未平倉' in k_str:  # 寬鬆比對
-                                    val = v_str.replace(',', '')
-                                    oi = 0 if val == '-' or not val else int(float(val))
-                                elif '到期' in k_str: # 寬鬆比對
-                                    contract_month = v_str
-                                    
-                            # 🔥 裝回防護罩：必須要有留倉口數 (oi > 0) 才收錄！
-                            if strike >= 10000 and oi > 0 and contract_month:
-                                if contract_month not in contracts_data:
-                                    contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
-                                    
-                                contracts_data[contract_month]['total_oi'] += oi
-                                
-                                if '買' in cp or 'Call' in cp:
-                                    contracts_data[contract_month]['calls'][strike] = max(contracts_data[contract_month]['calls'].get(strike, 0), oi)
-                                elif '賣' in cp or 'Put' in cp:
-                                    contracts_data[contract_month]['puts'][strike] = max(contracts_data[contract_month]['puts'].get(strike, 0), oi)
-                        except:
-                            pass
-                            
-                    if contracts_data:
-                        success = True
-                        break
+                    # 動態尋找欄位確切的索引值
+                    idx_strike, idx_cp, idx_oi, idx_month = -1, -1, -1, -1
+                    for i, col in enumerate(header):
+                        if '履約價' in col: idx_strike = i
+                        elif '買賣權' in col: idx_cp = i
+                        elif '未平倉' in col: idx_oi = i
+                        elif '到期' in col or '週別' in col: idx_month = i
                         
+                    if idx_strike != -1 and idx_oi != -1:
+                        for row in reader:
+                            if len(row) <= max(idx_strike, idx_cp, idx_oi, idx_month):
+                                continue
+                                
+                            try:
+                                strike = int(float(row[idx_strike].strip()))
+                                cp = row[idx_cp].strip()
+                                oi_str = row[idx_oi].replace(',', '').strip()
+                                oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
+                                contract_month = row[idx_month].strip()
+                                
+                                # 🔥 只有口數大於 0 才收錄
+                                if strike >= 10000 and oi > 0 and contract_month:
+                                    if contract_month not in contracts_data:
+                                        contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
+                                        
+                                    contracts_data[contract_month]['total_oi'] += oi
+                                    
+                                    if '買' in cp or 'Call' in cp:
+                                        contracts_data[contract_month]['calls'][strike] = max(contracts_data[contract_month]['calls'].get(strike, 0), oi)
+                                    elif '賣' in cp or 'Put' in cp:
+                                        contracts_data[contract_month]['puts'][strike] = max(contracts_data[contract_month]['puts'].get(strike, 0), oi)
+                            except:
+                                pass
+                                
+                        if contracts_data:
+                            success = True
+                            break
+                            
             current_date -= datetime.timedelta(days=1)
             
         if success and contracts_data:
@@ -169,7 +170,6 @@ with st.spinner("正在自動同步期交所最新籌碼數據..."):
     futures_records = fetch_5d_futures_data()
     all_opt_data = fetch_all_active_options_data()
 
-# --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
 if futures_records:
     df = pd.DataFrame(futures_records)
@@ -201,14 +201,10 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-# --- 區塊二：選擇權全戰區分頁 T 字報價單 ---
 st.subheader("🎯 選擇權全戰區 T 字報價單")
 
 if all_opt_data:
-    # 依照市場總留倉量 (total_oi) 排序，抓出前 3 大最熱絡的合約來建立分頁
     sorted_contracts = sorted(all_opt_data.keys(), key=lambda k: all_opt_data[k]['total_oi'], reverse=True)[:3]
-    
-    # 動態產生分頁 (Tabs)
     tabs = st.tabs([f"📅 {c}" for c in sorted_contracts])
     
     for idx, tab in enumerate(tabs):

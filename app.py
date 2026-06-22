@@ -78,9 +78,9 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極解開限制版：直接把合約內「所有」履約價的資料完整保留！
+# 核心修正：強制鎖定「純月合約」，並撈出該合約所有履約價
 @st.cache_data(ttl=3600)
-def fetch_all_options_data():
+def fetch_near_month_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -106,6 +106,9 @@ def fetch_all_options_data():
                     
                 if "交易日期" in text_data and "履約價" in text_data:
                     reader = csv.DictReader(StringIO(text_data))
+                    # 清洗表頭空白
+                    reader.fieldnames = [f.strip() for f in reader.fieldnames if f]
+                    
                     for row in reader:
                         try:
                             strike = int(float(row.get('履約價', 0)))
@@ -114,11 +117,10 @@ def fetch_all_options_data():
                             oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
                             contract_month = row.get('到期月份(週別)', '').strip()
                             
-                            if strike >= 10000 and oi > 0 and contract_month:
+                            # 🎯 只抓純數字、長度為 6 的月合約 (剔除帶 W 的週合約)
+                            if strike >= 10000 and contract_month.isdigit() and len(contract_month) == 6:
                                 if contract_month not in contracts_data:
-                                    contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
-                                    
-                                contracts_data[contract_month]['total_oi'] += oi
+                                    contracts_data[contract_month] = {'calls': {}, 'puts': {}}
                                 
                                 if '買' in cp or 'Call' in cp:
                                     contracts_data[contract_month]['calls'][strike] = max(contracts_data[contract_month]['calls'].get(strike, 0), oi)
@@ -134,26 +136,21 @@ def fetch_all_options_data():
             current_date -= datetime.timedelta(days=1)
             
         if success and contracts_data:
-            result = {}
-            for contract, data in contracts_data.items():
-                # 解除限制：不再切片 [:3]，保留所有履約價並排序
-                calls = sorted(list(data['calls'].items()), key=lambda x: x[0], reverse=True)
-                puts = sorted(list(data['puts'].items()), key=lambda x: x[0], reverse=True)
-                
-                result[contract] = {
-                    'total_oi': data['total_oi'],
-                    'calls': calls,
-                    'puts': puts
-                }
-            return result
+            # 自動挑選最接近當下的近月合約 (例如 202607)
+            near_month = min(contracts_data.keys())
             
-        return {}
+            calls = sorted(list(contracts_data[near_month]['calls'].items()), key=lambda x: x[0], reverse=True)
+            puts = sorted(list(contracts_data[near_month]['puts'].items()), key=lambda x: x[0], reverse=True)
+            
+            return near_month, calls, puts
+            
+        return "", [], []
     except Exception as e:
-        return {}
+        return "", [], []
 
 with st.spinner("正在自動同步期交所最新籌碼數據..."):
     futures_records = fetch_5d_futures_data()
-    all_opt_data = fetch_all_options_data()
+    near_month, top_calls, top_puts = fetch_near_month_options_data()
 
 # --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
@@ -187,47 +184,34 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-# --- 區塊二：選擇權全戰區 T 字報價表 ---
-st.subheader("🎯 選擇權全戰區 T 字報價表")
+# --- 區塊二：選擇權近月全戰區 T 字報價表 ---
+st.subheader(f"🎯 近月合約 T 字全報價單 ({near_month})")
 
-if all_opt_data:
-    # 依照總 OI 排序，讓主力合約排在下拉選單第一個
-    sorted_contracts = sorted(all_opt_data.keys(), key=lambda k: all_opt_data[k]['total_oi'], reverse=True)
-    selected_contract = st.selectbox("📅 選擇要觀察的合約月份：", sorted_contracts, index=0)
-    
-    top_calls = all_opt_data[selected_contract]['calls']
-    top_puts = all_opt_data[selected_contract]['puts']
+if top_calls or top_puts:
+    # 找出近月合約內部真實的最大值
+    max_call_oi = max([oi for strike, oi in top_calls]) if top_calls else 0
+    max_put_oi = max([oi for strike, oi in top_puts]) if top_puts else 0
 
-    if top_calls or top_puts:
-        # 找出最大值，用來掛上您的 SIP 戰術徽章
-        max_call_oi = max([oi for strike, oi in top_calls]) if top_calls else 0
-        max_put_oi = max([oi for strike, oi in top_puts]) if top_puts else 0
+    all_strikes = set([s for s, oi in top_calls] + [s for s, oi in top_puts])
+    sorted_strikes = sorted(list(all_strikes), reverse=True)
 
-        # 整合出該合約所有出現過的履約價，由高到低排列
-        all_strikes = set([s for s, oi in top_calls] + [s for s, oi in top_puts])
-        sorted_strikes = sorted(list(all_strikes), reverse=True)
+    t_rows = []
+    for strike in sorted_strikes:
+        c_oi = next((oi for s, oi in top_calls if s == strike), 0)
+        p_oi = next((oi for s, oi in top_puts if s == strike), 0)
 
-        t_rows = []
-        for strike in sorted_strikes:
-            # 抓出對應履約價的口數，沒有的話補 0
-            c_oi = next((oi for s, oi in top_calls if s == strike), 0)
-            p_oi = next((oi for s, oi in top_puts if s == strike), 0)
+        # 標記該合約真正的最大部位
+        c_display = f"⚠️ {c_oi:,}" if c_oi == max_call_oi and c_oi > 0 else (f"{c_oi:,}" if c_oi > 0 else "-")
+        p_display = f"🛡️ {p_oi:,}" if p_oi == max_put_oi and p_oi > 0 else (f"{p_oi:,}" if p_oi > 0 else "-")
 
-            # 視覺化邏輯：若是最大值則加上 Emoji，若是 0 則顯示 '-'
-            c_display = f"⚠️ {c_oi:,}" if c_oi == max_call_oi and c_oi > 0 else (f"{c_oi:,}" if c_oi > 0 else "-")
-            p_display = f"🛡️ {p_oi:,}" if p_oi == max_put_oi and p_oi > 0 else (f"{p_oi:,}" if p_oi > 0 else "-")
+        t_rows.append({
+            "🔴 買權 Call (OI)": c_display,
+            "🎯 履約價": f"{strike:,}",
+            "🟢 賣權 Put (OI)": p_display
+        })
 
-            t_rows.append({
-                "🔴 買權 Call (OI)": c_display,
-                "🎯 履約價": f"{strike:,}",
-                "🟢 賣權 Put (OI)": p_display
-            })
-
-        df_t = pd.DataFrame(t_rows)
-        
-        # 渲染出漂亮的 T 字報價單一表格
-        st.dataframe(df_t, hide_index=True, use_container_width=True)
-
+    df_t = pd.DataFrame(t_rows)
+    st.dataframe(df_t, hide_index=True, use_container_width=True)
 else:
     st.warning("目前無法取得選擇權資料，請稍後重試。")
 

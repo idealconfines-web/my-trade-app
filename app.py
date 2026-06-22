@@ -19,21 +19,23 @@ st.markdown("""
 
 st.title("📊 台指期權籌碼自動化追蹤")
 
-# 頂部策略備忘卡片
 st.info("""
     **💡 SIP 策略備忘**
     * 盤勢推演節奏：**情緒超跌 ➔ 理性回補 ➔ 中盤動盪**
     * 核心守則：密切留意賣權 (Put) 的 **LL (下限區間)**，若伴隨最大量 OI 增長且未被實質跌破，往往是「情緒超跌」後的絕佳觀察點；向上挑戰 Call 最大壓力區時需防洗盤。
 """)
 
-# 定義抓取期貨近5日資料的函式
+# 核心修正 1：強制校正為台灣時間，防止雲端主機時差導致抓錯日期
+def get_tw_time():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
 @st.cache_data(ttl=3600)
 def fetch_5d_futures_data():
     url = "https://www.taifex.com.tw/cht/3/futContractsDate"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     records = []
-    current_date = datetime.datetime.now()
+    current_date = get_tw_time()
     days_checked = 0
     
     while len(records) < 5 and days_checked < 15:
@@ -74,51 +76,66 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 定義抓取選擇權前三大 OI 的函式 (修正版：精準鎖定未平倉量)
+# 核心修正 2：加入日期迴圈遞迴抓取，並強化數值萃取邏輯
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        # 改用 POST 請求並明確指定 TXO，防止期交所擋掉空白查詢
-        payload = {
-            'queryType': '2',
-            'marketCode': '0',
-            'commodity_id': 'TXO',
-            'queryDate': '',
-            'MarketCode': '0',
-            'commodity_idt': 'TXO'
-        }
-        response = requests.post(url, headers=headers, data=payload, timeout=5)
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        rows = soup.find_all('tr')
+        current_date = get_tw_time()
+        success = False
         calls, puts = [], []
-        current_strike = 0
         
-        for row in rows:
-            tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
-            if len(tds) < 10: 
-                continue
-            
-            for text in tds:
-                if text.isdigit() and 10000 <= int(text) <= 40000:
-                    current_strike = int(text)
-                    break
-            
-            # 期交所的「未平倉量」固定在表格的最後一格 (tds[-1])
-            oi_str = tds[-1]
-            if not oi_str.isdigit():
-                continue
+        # 往前搜尋直到找到有資料的營業日
+        for _ in range(10):
+            if current_date.weekday() < 5:
+                date_str = current_date.strftime('%Y/%m/%d')
+                payload = {'queryDate': date_str, 'commodity_id': 'TXO', 'MarketCode': '0'}
+                res = requests.post(url, headers=headers, data=payload, timeout=5)
+                res.encoding = 'utf-8'
+                soup = BeautifulSoup(res.text, 'html.parser')
                 
-            if '買權' in tds:
-                calls.append((current_strike, int(oi_str)))
-            elif '賣權' in tds:
-                puts.append((current_strike, int(oi_str)))
-        
-        if calls and puts:
-            # 針對相同的履約價可能有多個合約月份，我們先用 dict 整合出各履約價的最大 OI
+                rows = soup.find_all('tr')
+                
+                for row in rows:
+                    tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
+                    if len(tds) < 8: 
+                        continue
+                    
+                    is_call = '買權' in tds
+                    is_put = '賣權' in tds
+                    if not is_call and not is_put:
+                        continue
+                        
+                    current_strike = 0
+                    for text in tds:
+                        if text.isdigit() and 10000 <= int(text) <= 40000:
+                            current_strike = int(text)
+                            break
+                            
+                    if current_strike == 0:
+                        continue
+                        
+                    # 取出最後一欄的未平倉量，如果是 '-' 則視為 0
+                    oi_str = tds[-1]
+                    if oi_str == '-':
+                        oi_str = '0'
+                        
+                    if not oi_str.isdigit():
+                        continue
+                        
+                    if is_call:
+                        calls.append((current_strike, int(oi_str)))
+                    elif is_put:
+                        puts.append((current_strike, int(oi_str)))
+                
+                if calls and puts:
+                    success = True
+                    break
+                    
+            current_date -= datetime.timedelta(days=1)
+            
+        if success and calls and puts:
             call_dict = {}
             put_dict = {}
             for strike, oi in calls:
@@ -126,7 +143,6 @@ def fetch_top3_options_data():
             for strike, oi in puts:
                 put_dict[strike] = max(put_dict.get(strike, 0), oi)
             
-            # 轉回 list 並排序取前三大
             unique_calls = list(call_dict.items())
             unique_puts = list(put_dict.items())
             
@@ -143,7 +159,6 @@ with st.spinner("正在抓取期交所近五日籌碼與選擇權數據..."):
     futures_records = fetch_5d_futures_data()
     top_calls, top_puts = fetch_top3_options_data()
 
-# --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
 if futures_records:
     df = pd.DataFrame(futures_records)
@@ -175,7 +190,6 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-# --- 區塊二：選擇權支撐壓力階梯圖 ---
 st.subheader("🎯 選擇權價格階梯 (前三大 OI)")
 
 if top_calls and top_puts:

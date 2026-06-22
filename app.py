@@ -78,85 +78,90 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
+# 核心修正：讀取 CSV 後，自動找出「主力合約」並抓取前 5 大
 @st.cache_data(ttl=3600)
-def fetch_top3_options_data():
-    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
+def fetch_top5_options_data():
+    url = "https://www.taifex.com.tw/cht/3/optDataDown"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         current_date = get_tw_time()
         success = False
-        calls, puts = [], []
+        contracts_data = {}
         
         for _ in range(10):
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
                 payload = {
-                    'queryType': '2',
-                    'marketCode': '0',
+                    'down_type': '1',
                     'commodity_id': 'TXO',
-                    'queryDate': date_str,
-                    'MarketCode': '0',
-                    'commodity_idt': 'TXO'
+                    'queryStartDate': date_str,
+                    'queryEndDate': date_str
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
-                res.encoding = 'utf-8'
-                soup = BeautifulSoup(res.text, 'html.parser')
                 
-                rows = soup.find_all('tr')
-                for row in rows:
-                    tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
-                    if not tds: continue
+                try:
+                    text_data = res.content.decode('big5')
+                except:
+                    text_data = res.content.decode('utf-8', errors='ignore')
                     
-                    cp_idx = -1
-                    for i, text in enumerate(tds):
-                        if '買權' in text or '賣權' in text or 'Call' in text or 'Put' in text:
-                            cp_idx = i
-                            break
+                if "交易日期" in text_data and "履約價" in text_data:
+                    reader = csv.DictReader(StringIO(text_data))
+                    for row in reader:
+                        try:
+                            strike = int(float(row.get('履約價', 0)))
+                            cp = row.get('買賣權', '').strip()
+                            oi_str = row.get('未平倉量', '0').replace(',', '').strip()
+                            oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
+                            contract_month = row.get('到期月份(週別)', '').strip()
                             
-                    if cp_idx >= 1 and len(tds) > cp_idx + 8:
-                        strike_text = tds[cp_idx - 1]
-                        oi_text = tds[cp_idx + 8]
+                            # 過濾有效口數與合約
+                            if strike >= 10000 and oi > 0 and contract_month:
+                                if contract_month not in contracts_data:
+                                    contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
+                                    
+                                contracts_data[contract_month]['total_oi'] += oi
+                                
+                                if '買' in cp or 'Call' in cp:
+                                    contracts_data[contract_month]['calls'][strike] = max(contracts_data[contract_month]['calls'].get(strike, 0), oi)
+                                elif '賣' in cp or 'Put' in cp:
+                                    contracts_data[contract_month]['puts'][strike] = max(contracts_data[contract_month]['puts'].get(strike, 0), oi)
+                        except:
+                            pass
+                            
+                    if contracts_data:
+                        success = True
+                        break
                         
-                        if strike_text.isdigit():
-                            strike = int(strike_text)
-                            oi = 0 if oi_text == '-' or not oi_text or not oi_text.isdigit() else int(oi_text)
-                            
-                            if strike >= 10000 and oi > 0:
-                                if '買' in tds[cp_idx] or 'Call' in tds[cp_idx]:
-                                    calls.append((strike, oi))
-                                else:
-                                    puts.append((strike, oi))
-                
-                if calls and puts:
-                    success = True
-                    break
-                    
             current_date -= datetime.timedelta(days=1)
             
-        if success and calls and puts:
-            call_dict = {}
-            put_dict = {}
-            for strike, oi in calls:
-                call_dict[strike] = max(call_dict.get(strike, 0), oi)
-            for strike, oi in puts:
-                put_dict[strike] = max(put_dict.get(strike, 0), oi)
+        if success and contracts_data:
+            # 自動鎖定總未平倉量最大的「主力合約」
+            active_contract = max(contracts_data.keys(), key=lambda k: contracts_data[k]['total_oi'])
             
-            unique_calls = list(call_dict.items())
-            unique_puts = list(put_dict.items())
+            calls = list(contracts_data[active_contract]['calls'].items())
+            puts = list(contracts_data[active_contract]['puts'].items())
             
-            # 排序：Call 由大到小，Put 由大到小
-            top_calls = sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3]
-            top_puts = sorted(unique_puts, key=lambda x: x[1], reverse=True)[:3]
+            # 取出前 5 大 OI (排序邏輯：數值由大到小排序，取前 5 筆)
+            top_calls = sorted(calls, key=lambda x: x[1], reverse=True)[:5]
+            top_puts = sorted(puts, key=lambda x: x[1], reverse=True)[:5]
             
-            return top_calls, top_puts
+            # 為了表格好閱讀，最後依照「履約價」由高到低排好
+            top_calls = sorted(top_calls, key=lambda x: x[0], reverse=True)
+            top_puts = sorted(top_puts, key=lambda x: x[0], reverse=True)
             
-        return [], []
+            return active_contract, top_calls, top_puts
+            
+        return "", [], []
     except Exception as e:
-        return [], []
+        return "", [], []
 
 with st.spinner("正在自動同步期交所最新籌碼數據..."):
     futures_records = fetch_5d_futures_data()
-    top_calls, top_puts = fetch_top3_options_data()
+    opt_result = fetch_top5_options_data()
+    if len(opt_result) == 3:
+        active_contract, top_calls, top_puts = opt_result
+    else:
+        active_contract, top_calls, top_puts = "", [], []
 
 # --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
@@ -190,35 +195,36 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-# --- 區塊二：選擇權支撐壓力表 (純原生元件，絕不報錯) ---
-st.subheader("🎯 選擇權大部位留倉觀測 (前三高 OI)")
+# --- 區塊二：選擇權支撐壓力表 ---
+st.subheader(f"🎯 選擇權主力合約支撐壓力 ({active_contract} 前五大 OI)")
 
 if top_calls and top_puts:
-    # 建立純數據的表格
+    # 找出最大值用來標記
+    max_call_oi = max([oi for strike, oi in top_calls])
+    max_put_oi = max([oi for strike, oi in top_puts])
+
     call_rows = []
-    for i, (strike, oi) in enumerate(top_calls):
-        tag = "⚠️ 最大壓力" if i == 0 else f"壓力 {i+1}"
-        call_rows.append({"位置": tag, "履約價": strike, "未平倉量(口)": oi})
+    for strike, oi in top_calls:
+        tag = "⚠️ 最大壓力" if oi == max_call_oi else "上檔壓力"
+        call_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
         
     put_rows = []
-    for i, (strike, oi) in enumerate(top_puts):
-        tag = "🛡️ LL 防守" if i == 0 else f"支撐 {i+1}"
-        put_rows.append({"位置": tag, "履約價": strike, "未平倉量(口)": oi})
+    for strike, oi in top_puts:
+        tag = "🛡️ LL 防守" if oi == max_put_oi else "下檔支撐"
+        put_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
 
-    # 轉成標準表格格式
     df_c = pd.DataFrame(call_rows)
     df_p = pd.DataFrame(put_rows)
 
-    # 用 Streamlit 原生左右分欄展示
     col_left, col_right = st.columns(2)
-    
     with col_left:
-        st.caption("🔴 買權 Call (上檔壓力)")
+        st.caption("🔴 買權 Call")
         st.dataframe(df_c, hide_index=True, use_container_width=True)
         
     with col_right:
-        st.caption("🟢 賣權 Put (下檔支撐)")
+        st.caption("🟢 賣權 Put")
         st.dataframe(df_p, hide_index=True, use_container_width=True)
+
 else:
     st.warning("目前無法取得選擇權資料，請稍後重試。")
 

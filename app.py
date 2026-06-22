@@ -78,9 +78,9 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 核心修正：讀取 CSV 後，自動找出「主力合約」並抓取前 5 大
+# 進化版：撈出所有合約，並在 App 提供下拉選單，且改回前 3 大
 @st.cache_data(ttl=3600)
-def fetch_top5_options_data():
+def fetch_all_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -114,7 +114,6 @@ def fetch_top5_options_data():
                             oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
                             contract_month = row.get('到期月份(週別)', '').strip()
                             
-                            # 過濾有效口數與合約
                             if strike >= 10000 and oi > 0 and contract_month:
                                 if contract_month not in contracts_data:
                                     contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
@@ -135,33 +134,33 @@ def fetch_top5_options_data():
             current_date -= datetime.timedelta(days=1)
             
         if success and contracts_data:
-            # 自動鎖定總未平倉量最大的「主力合約」
-            active_contract = max(contracts_data.keys(), key=lambda k: contracts_data[k]['total_oi'])
+            result = {}
+            for contract, data in contracts_data.items():
+                calls = list(data['calls'].items())
+                puts = list(data['puts'].items())
+                
+                # 改回取前 3 大 OI
+                top_calls = sorted(calls, key=lambda x: x[1], reverse=True)[:3]
+                top_puts = sorted(puts, key=lambda x: x[1], reverse=True)[:3]
+                
+                # 依照履約價由高到低排列
+                top_calls = sorted(top_calls, key=lambda x: x[0], reverse=True)
+                top_puts = sorted(top_puts, key=lambda x: x[0], reverse=True)
+                
+                result[contract] = {
+                    'total_oi': data['total_oi'],
+                    'calls': top_calls,
+                    'puts': top_puts
+                }
+            return result
             
-            calls = list(contracts_data[active_contract]['calls'].items())
-            puts = list(contracts_data[active_contract]['puts'].items())
-            
-            # 取出前 5 大 OI (排序邏輯：數值由大到小排序，取前 5 筆)
-            top_calls = sorted(calls, key=lambda x: x[1], reverse=True)[:5]
-            top_puts = sorted(puts, key=lambda x: x[1], reverse=True)[:5]
-            
-            # 為了表格好閱讀，最後依照「履約價」由高到低排好
-            top_calls = sorted(top_calls, key=lambda x: x[0], reverse=True)
-            top_puts = sorted(top_puts, key=lambda x: x[0], reverse=True)
-            
-            return active_contract, top_calls, top_puts
-            
-        return "", [], []
+        return {}
     except Exception as e:
-        return "", [], []
+        return {}
 
 with st.spinner("正在自動同步期交所最新籌碼數據..."):
     futures_records = fetch_5d_futures_data()
-    opt_result = fetch_top5_options_data()
-    if len(opt_result) == 3:
-        active_contract, top_calls, top_puts = opt_result
-    else:
-        active_contract, top_calls, top_puts = "", [], []
+    all_opt_data = fetch_all_options_data()
 
 # --- 區塊一：期貨近五日動向 ---
 st.subheader("📈 外資期貨近五日動向")
@@ -196,35 +195,43 @@ else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
 # --- 區塊二：選擇權支撐壓力表 ---
-st.subheader(f"🎯 選擇權主力合約支撐壓力 ({active_contract} 前五大 OI)")
+st.subheader("🎯 選擇權大部位留倉觀測 (前三大 OI)")
 
-if top_calls and top_puts:
-    # 找出最大值用來標記
-    max_call_oi = max([oi for strike, oi in top_calls])
-    max_put_oi = max([oi for strike, oi in top_puts])
+if all_opt_data:
+    # 將合約依照總 OI 排序，讓主力合約排在下拉選單第一個
+    sorted_contracts = sorted(all_opt_data.keys(), key=lambda k: all_opt_data[k]['total_oi'], reverse=True)
+    
+    # 增加下拉選單功能
+    selected_contract = st.selectbox("📅 選擇要觀察的合約月份：", sorted_contracts, index=0)
+    
+    top_calls = all_opt_data[selected_contract]['calls']
+    top_puts = all_opt_data[selected_contract]['puts']
 
-    call_rows = []
-    for strike, oi in top_calls:
-        tag = "⚠️ 最大壓力" if oi == max_call_oi else "上檔壓力"
-        call_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
-        
-    put_rows = []
-    for strike, oi in top_puts:
-        tag = "🛡️ LL 防守" if oi == max_put_oi else "下檔支撐"
-        put_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
+    if top_calls and top_puts:
+        max_call_oi = max([oi for strike, oi in top_calls])
+        max_put_oi = max([oi for strike, oi in top_puts])
 
-    df_c = pd.DataFrame(call_rows)
-    df_p = pd.DataFrame(put_rows)
+        call_rows = []
+        for strike, oi in top_calls:
+            tag = "⚠️ 最大壓力" if oi == max_call_oi else "上檔壓力"
+            call_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
+            
+        put_rows = []
+        for strike, oi in top_puts:
+            tag = "🛡️ LL 防守" if oi == max_put_oi else "下檔支撐"
+            put_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
 
-    col_left, col_right = st.columns(2)
-    with col_left:
-        st.caption("🔴 買權 Call")
-        st.dataframe(df_c, hide_index=True, use_container_width=True)
-        
-    with col_right:
-        st.caption("🟢 賣權 Put")
-        st.dataframe(df_p, hide_index=True, use_container_width=True)
+        df_c = pd.DataFrame(call_rows)
+        df_p = pd.DataFrame(put_rows)
 
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.caption("🔴 買權 Call")
+            st.dataframe(df_c, hide_index=True, use_container_width=True)
+            
+        with col_right:
+            st.caption("🟢 賣權 Put")
+            st.dataframe(df_p, hide_index=True, use_container_width=True)
 else:
     st.warning("目前無法取得選擇權資料，請稍後重試。")
 

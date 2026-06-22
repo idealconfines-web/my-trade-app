@@ -4,9 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 import datetime
-import csv
-from io import StringIO
 
+# 設定網頁標題與手機優化排版
 st.set_page_config(page_title="期權籌碼自動化儀表板", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -23,6 +22,7 @@ st.markdown("""
 
 st.title("📊 台指期權籌碼自動化追蹤")
 
+# 策略備忘
 st.info("""
     **💡 SIP 策略備忘**
     * 盤勢推演節奏：**情緒超跌 ➔ 理性回補 ➔ 中盤動盪**
@@ -79,10 +79,10 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 最堅固的解析法：直接鎖定陣列位置，無視多餘空白
+# 終極防禦版：動態雷達尋找網頁表頭，不再依賴固定格式
 @st.cache_data(ttl=3600)
 def fetch_all_active_options_data():
-    url = "https://www.taifex.com.tw/cht/3/optDataDown"
+    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         current_date = get_tw_time()
@@ -93,61 +93,64 @@ def fetch_all_active_options_data():
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
                 payload = {
-                    'down_type': '1',
+                    'queryType': '2',
+                    'marketCode': '0',
                     'commodity_id': 'TXO',
-                    'queryStartDate': date_str,
-                    'queryEndDate': date_str
+                    'queryDate': date_str
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
+                res.encoding = 'utf-8'
+                soup = BeautifulSoup(res.text, 'html.parser')
                 
-                try:
-                    text_data = res.content.decode('big5')
-                except:
-                    text_data = res.content.decode('utf-8', errors='ignore')
-                    
-                if "交易日期" in text_data and "履約價" in text_data:
-                    lines = text_data.splitlines()
-                    reader = csv.reader(lines)
-                    header = next(reader, [])
-                    
-                    # 動態尋找欄位確切的索引值
-                    idx_strike, idx_cp, idx_oi, idx_month = -1, -1, -1, -1
-                    for i, col in enumerate(header):
-                        if '履約價' in col: idx_strike = i
-                        elif '買賣權' in col: idx_cp = i
-                        elif '未平倉' in col: idx_oi = i
-                        elif '到期' in col or '週別' in col: idx_month = i
+                rows = soup.find_all('tr')
+                
+                header_idx = -1
+                col_month, col_strike, col_cp, col_oi = -1, -1, -1, -1
+                
+                # 掃描表頭位置
+                for idx, row in enumerate(rows):
+                    ths = [th.get_text(strip=True) for th in row.find_all(['th', 'td'])]
+                    if '履約價' in ths and '未平倉量' in ths:
+                        header_idx = idx
+                        for i, text in enumerate(ths):
+                            if '到期' in text or '週別' in text: col_month = i
+                            elif '履約價' in text: col_strike = i
+                            elif '買賣權' in text: col_cp = i
+                            elif '未平倉' in text: col_oi = i
+                        break
                         
-                    if idx_strike != -1 and idx_oi != -1:
-                        for row in reader:
-                            if len(row) <= max(idx_strike, idx_cp, idx_oi, idx_month):
-                                continue
-                                
-                            try:
-                                strike = int(float(row[idx_strike].strip()))
-                                cp = row[idx_cp].strip()
-                                oi_str = row[idx_oi].replace(',', '').strip()
-                                oi = int(float(oi_str)) if oi_str and oi_str != '-' else 0
-                                contract_month = row[idx_month].strip()
-                                
-                                # 🔥 只有口數大於 0 才收錄
-                                if strike >= 10000 and oi > 0 and contract_month:
-                                    if contract_month not in contracts_data:
-                                        contracts_data[contract_month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
-                                        
-                                    contracts_data[contract_month]['total_oi'] += oi
-                                    
-                                    if '買' in cp or 'Call' in cp:
-                                        contracts_data[contract_month]['calls'][strike] = max(contracts_data[contract_month]['calls'].get(strike, 0), oi)
-                                    elif '賣' in cp or 'Put' in cp:
-                                        contracts_data[contract_month]['puts'][strike] = max(contracts_data[contract_month]['puts'].get(strike, 0), oi)
-                            except:
-                                pass
-                                
-                        if contracts_data:
-                            success = True
-                            break
+                # 若成功定位，開始掃描數據
+                if header_idx != -1 and col_strike != -1 and col_oi != -1:
+                    for row in rows[header_idx+1:]:
+                        tds = [td.get_text(strip=True) for td in row.find_all('td')]
+                        if len(tds) <= max(col_month, col_strike, col_cp, col_oi):
+                            continue
                             
+                        try:
+                            month = tds[col_month]
+                            strike = int(float(tds[col_strike].replace(',', '')))
+                            cp = tds[col_cp]
+                            oi_str = tds[col_oi].replace(',', '')
+                            oi = int(float(oi_str)) if oi_str.isdigit() else 0
+                            
+                            # 嚴格篩選：履約價合理、口數存在
+                            if strike >= 10000 and oi > 0 and month:
+                                if month not in contracts_data:
+                                    contracts_data[month] = {'calls': {}, 'puts': {}, 'total_oi': 0}
+                                    
+                                contracts_data[month]['total_oi'] += oi
+                                
+                                if '買' in cp or 'Call' in cp:
+                                    contracts_data[month]['calls'][strike] = max(contracts_data[month]['calls'].get(strike, 0), oi)
+                                elif '賣' in cp or 'Put' in cp:
+                                    contracts_data[month]['puts'][strike] = max(contracts_data[month]['puts'].get(strike, 0), oi)
+                        except:
+                            pass
+                            
+                    if contracts_data:
+                        success = True
+                        break
+                        
             current_date -= datetime.timedelta(days=1)
             
         if success and contracts_data:

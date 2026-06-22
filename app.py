@@ -75,7 +75,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極簡單粗暴版：不依賴絕對欄位位置，靠字串錨點定位
+# 智慧相對定位版：精準鎖定買賣權後方第 8 格的未平倉量
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
@@ -112,16 +112,16 @@ def fetch_top3_options_data():
                             cp_idx = i
                             break
                             
-                    # 只要找到買賣權，前一格必為履約價，最後一格必為未平倉量
-                    if cp_idx >= 1:
+                    # 核心邏輯：前一格是履約價，後方第 8 格是未平倉量
+                    if cp_idx >= 1 and len(tds) > cp_idx + 8:
                         strike_text = tds[cp_idx - 1]
-                        oi_text = tds[-1]
+                        oi_text = tds[cp_idx + 8]
                         
                         if strike_text.isdigit():
                             strike = int(strike_text)
-                            oi = 0 if oi_text == '-' or not oi_text else int(oi_text)
+                            oi = 0 if oi_text == '-' or not oi_text or not oi_text.isdigit() else int(oi_text)
                             
-                            # 過濾幽靈合約
+                            # 只收集真正有留倉口數堆積的部位
                             if strike >= 10000 and oi > 0:
                                 if '買' in tds[cp_idx] or 'Call' in tds[cp_idx]:
                                     calls.append((strike, oi))
@@ -145,6 +145,7 @@ def fetch_top3_options_data():
             unique_calls = list(call_dict.items())
             unique_puts = list(put_dict.items())
             
+            # 篩選出留倉口數前三大的密集堆積區，並依履約價高低排序成階梯圖
             top_calls = sorted(sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
             top_puts = sorted(sorted(unique_puts, key=lambda x: x[1], reverse=True)[:3], key=lambda x: x[0], reverse=True)
             

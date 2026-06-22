@@ -78,10 +78,9 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 核心修正：使用最穩定的 CSV 下載 API，絕對不會抓錯格子！
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
-    url = "https://www.taifex.com.tw/cht/3/optDataDown"
+    url = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         current_date = get_tw_time()
@@ -92,48 +91,46 @@ def fetch_top3_options_data():
             if current_date.weekday() < 5:
                 date_str = current_date.strftime('%Y/%m/%d')
                 payload = {
-                    'down_type': '1',
+                    'queryType': '2',
+                    'marketCode': '0',
                     'commodity_id': 'TXO',
-                    'queryStartDate': date_str,
-                    'queryEndDate': date_str
+                    'queryDate': date_str,
+                    'MarketCode': '0',
+                    'commodity_idt': 'TXO'
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
+                res.encoding = 'utf-8'
+                soup = BeautifulSoup(res.text, 'html.parser')
                 
-                try:
-                    text_data = res.content.decode('big5')
-                except:
-                    text_data = res.content.decode('utf-8', errors='ignore')
+                rows = soup.find_all('tr')
+                for row in rows:
+                    tds = [td.get_text(strip=True).replace(',', '') for td in row.find_all('td')]
+                    if not tds: continue
                     
-                if "交易日期" in text_data and "履約價" in text_data:
-                    reader = csv.DictReader(StringIO(text_data))
-                    for row in reader:
-                        try:
-                            strike, cp, oi = 0, '', 0
-                            for k, v in row.items():
-                                if not k or not v: continue
-                                k_str = str(k).strip()
-                                v_str = str(v).strip()
-                                
-                                if '履約價' in k_str:
-                                    strike = int(float(v_str))
-                                elif '買賣權' in k_str:
-                                    cp = v_str
-                                elif '未平倉' in k_str:  
-                                    val = v_str.replace(',', '')
-                                    oi = 0 if val == '-' or not val else int(float(val))
-                                    
-                            if strike >= 10000 and oi > 0:
-                                if '買' in cp or 'Call' in cp:
-                                    calls.append((strike, oi))
-                                elif '賣' in cp or 'Put' in cp:
-                                    puts.append((strike, oi))
-                        except:
-                            pass
+                    cp_idx = -1
+                    for i, text in enumerate(tds):
+                        if '買權' in text or '賣權' in text or 'Call' in text or 'Put' in text:
+                            cp_idx = i
+                            break
                             
-                    if calls and puts:
-                        success = True
-                        break
+                    if cp_idx >= 1 and len(tds) > cp_idx + 8:
+                        strike_text = tds[cp_idx - 1]
+                        oi_text = tds[cp_idx + 8]
                         
+                        if strike_text.isdigit():
+                            strike = int(strike_text)
+                            oi = 0 if oi_text == '-' or not oi_text or not oi_text.isdigit() else int(oi_text)
+                            
+                            if strike >= 10000 and oi > 0:
+                                if '買' in tds[cp_idx] or 'Call' in tds[cp_idx]:
+                                    calls.append((strike, oi))
+                                else:
+                                    puts.append((strike, oi))
+                
+                if calls and puts:
+                    success = True
+                    break
+                    
             current_date -= datetime.timedelta(days=1)
             
         if success and calls and puts:
@@ -147,4 +144,85 @@ def fetch_top3_options_data():
             unique_calls = list(call_dict.items())
             unique_puts = list(put_dict.items())
             
-            top_calls = sorted(sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3], key=lambda x
+            # 排序：Call 由大到小，Put 由大到小
+            top_calls = sorted(unique_calls, key=lambda x: x[1], reverse=True)[:3]
+            top_puts = sorted(unique_puts, key=lambda x: x[1], reverse=True)[:3]
+            
+            return top_calls, top_puts
+            
+        return [], []
+    except Exception as e:
+        return [], []
+
+with st.spinner("正在自動同步期交所最新籌碼數據..."):
+    futures_records = fetch_5d_futures_data()
+    top_calls, top_puts = fetch_top3_options_data()
+
+# --- 區塊一：期貨近五日動向 ---
+st.subheader("📈 外資期貨近五日動向")
+if futures_records:
+    df = pd.DataFrame(futures_records)
+    latest = df.iloc[-1]
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric(f"最新多單 ({latest['Date']})", f"{latest['Long']:,}")
+    col2.metric(f"最新空單 ({latest['Date']})", f"{latest['Short']:,}")
+    col3.metric("最新淨未平倉", f"{latest['Net']:,}", delta=int(latest['Net']))
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df['Date'],
+        y=df['Net'],
+        marker_color=['#ef4444' if val >= 0 else '#22c55e' for val in df['Net']],
+        text=[f"{val:,}" for val in df['Net']],
+        textposition='auto'
+    ))
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=220,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#94a3b8'),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(gridcolor='#334155')
+    )
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+else:
+    st.warning("目前無法取得期貨資料，請稍後重試。")
+
+# --- 區塊二：選擇權支撐壓力表 (純原生元件，絕不報錯) ---
+st.subheader("🎯 選擇權大部位留倉觀測 (前三高 OI)")
+
+if top_calls and top_puts:
+    # 建立純數據的表格
+    call_rows = []
+    for i, (strike, oi) in enumerate(top_calls):
+        tag = "⚠️ 最大壓力" if i == 0 else f"壓力 {i+1}"
+        call_rows.append({"位置": tag, "履約價": strike, "未平倉量(口)": oi})
+        
+    put_rows = []
+    for i, (strike, oi) in enumerate(top_puts):
+        tag = "🛡️ LL 防守" if i == 0 else f"支撐 {i+1}"
+        put_rows.append({"位置": tag, "履約價": strike, "未平倉量(口)": oi})
+
+    # 轉成標準表格格式
+    df_c = pd.DataFrame(call_rows)
+    df_p = pd.DataFrame(put_rows)
+
+    # 用 Streamlit 原生左右分欄展示
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        st.caption("🔴 買權 Call (上檔壓力)")
+        st.dataframe(df_c, hide_index=True, use_container_width=True)
+        
+    with col_right:
+        st.caption("🟢 賣權 Put (下檔支撐)")
+        st.dataframe(df_p, hide_index=True, use_container_width=True)
+else:
+    st.warning("目前無法取得選擇權資料，請稍後重試。")
+
+st.markdown("---")
+if st.button("🔄 立即重新整理數據"):
+    st.cache_data.clear()
+    st.rerun()

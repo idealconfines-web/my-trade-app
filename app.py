@@ -78,7 +78,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 進化版：撈出所有合約，並在 App 提供下拉選單，且改回前 3 大
+# 終極解開限制版：直接把合約內「所有」履約價的資料完整保留！
 @st.cache_data(ttl=3600)
 def fetch_all_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
@@ -136,21 +136,14 @@ def fetch_all_options_data():
         if success and contracts_data:
             result = {}
             for contract, data in contracts_data.items():
-                calls = list(data['calls'].items())
-                puts = list(data['puts'].items())
-                
-                # 改回取前 3 大 OI
-                top_calls = sorted(calls, key=lambda x: x[1], reverse=True)[:3]
-                top_puts = sorted(puts, key=lambda x: x[1], reverse=True)[:3]
-                
-                # 依照履約價由高到低排列
-                top_calls = sorted(top_calls, key=lambda x: x[0], reverse=True)
-                top_puts = sorted(top_puts, key=lambda x: x[0], reverse=True)
+                # 解除限制：不再切片 [:3]，保留所有履約價並排序
+                calls = sorted(list(data['calls'].items()), key=lambda x: x[0], reverse=True)
+                puts = sorted(list(data['puts'].items()), key=lambda x: x[0], reverse=True)
                 
                 result[contract] = {
                     'total_oi': data['total_oi'],
-                    'calls': top_calls,
-                    'puts': top_puts
+                    'calls': calls,
+                    'puts': puts
                 }
             return result
             
@@ -194,44 +187,47 @@ if futures_records:
 else:
     st.warning("目前無法取得期貨資料，請稍後重試。")
 
-# --- 區塊二：選擇權支撐壓力表 ---
-st.subheader("🎯 選擇權大部位留倉觀測 (前三大 OI)")
+# --- 區塊二：選擇權全戰區 T 字報價表 ---
+st.subheader("🎯 選擇權全戰區 T 字報價表")
 
 if all_opt_data:
-    # 將合約依照總 OI 排序，讓主力合約排在下拉選單第一個
+    # 依照總 OI 排序，讓主力合約排在下拉選單第一個
     sorted_contracts = sorted(all_opt_data.keys(), key=lambda k: all_opt_data[k]['total_oi'], reverse=True)
-    
-    # 增加下拉選單功能
     selected_contract = st.selectbox("📅 選擇要觀察的合約月份：", sorted_contracts, index=0)
     
     top_calls = all_opt_data[selected_contract]['calls']
     top_puts = all_opt_data[selected_contract]['puts']
 
-    if top_calls and top_puts:
-        max_call_oi = max([oi for strike, oi in top_calls])
-        max_put_oi = max([oi for strike, oi in top_puts])
+    if top_calls or top_puts:
+        # 找出最大值，用來掛上您的 SIP 戰術徽章
+        max_call_oi = max([oi for strike, oi in top_calls]) if top_calls else 0
+        max_put_oi = max([oi for strike, oi in top_puts]) if top_puts else 0
 
-        call_rows = []
-        for strike, oi in top_calls:
-            tag = "⚠️ 最大壓力" if oi == max_call_oi else "上檔壓力"
-            call_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
-            
-        put_rows = []
-        for strike, oi in top_puts:
-            tag = "🛡️ LL 防守" if oi == max_put_oi else "下檔支撐"
-            put_rows.append({"位置": tag, "履約價": f"{strike:,}", "未平倉口數": f"{oi:,}"})
+        # 整合出該合約所有出現過的履約價，由高到低排列
+        all_strikes = set([s for s, oi in top_calls] + [s for s, oi in top_puts])
+        sorted_strikes = sorted(list(all_strikes), reverse=True)
 
-        df_c = pd.DataFrame(call_rows)
-        df_p = pd.DataFrame(put_rows)
+        t_rows = []
+        for strike in sorted_strikes:
+            # 抓出對應履約價的口數，沒有的話補 0
+            c_oi = next((oi for s, oi in top_calls if s == strike), 0)
+            p_oi = next((oi for s, oi in top_puts if s == strike), 0)
 
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.caption("🔴 買權 Call")
-            st.dataframe(df_c, hide_index=True, use_container_width=True)
-            
-        with col_right:
-            st.caption("🟢 賣權 Put")
-            st.dataframe(df_p, hide_index=True, use_container_width=True)
+            # 視覺化邏輯：若是最大值則加上 Emoji，若是 0 則顯示 '-'
+            c_display = f"⚠️ {c_oi:,}" if c_oi == max_call_oi and c_oi > 0 else (f"{c_oi:,}" if c_oi > 0 else "-")
+            p_display = f"🛡️ {p_oi:,}" if p_oi == max_put_oi and p_oi > 0 else (f"{p_oi:,}" if p_oi > 0 else "-")
+
+            t_rows.append({
+                "🔴 買權 Call (OI)": c_display,
+                "🎯 履約價": f"{strike:,}",
+                "🟢 賣權 Put (OI)": p_display
+            })
+
+        df_t = pd.DataFrame(t_rows)
+        
+        # 渲染出漂亮的 T 字報價單一表格
+        st.dataframe(df_t, hide_index=True, use_container_width=True)
+
 else:
     st.warning("目前無法取得選擇權資料，請稍後重試。")
 

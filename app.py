@@ -26,31 +26,39 @@ st.info("""
     * 核心守則：密切留意賣權 (Put) 最大 OI 密集區是否伴隨大量增長，若未實質跌破即為「情緒超跌」後的關鍵定錨點。
 """)
 
-# 定義抓取期貨資料的函式 (進化版：精準定位未平倉欄位)
+# 定義抓取期貨資料的函式 (終極防護版：直接破解 HTML 結構)
 @st.cache_data(ttl=3600)
 def fetch_futures_data():
     url = "https://www.taifex.com.tw/cht/3/futContractsDate"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     try:
         response = requests.get(url, headers=headers)
-        # 讓 pandas 讀取網頁中所有表格
-        tables = pd.read_html(response.text)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        for df in tables:
-            for idx, row in df.iterrows():
-                # 將每一列的資料轉為字串，並過濾掉空白儲存格
-                vals = [str(x) for x in row.values if str(x) != 'nan']
+        rows = soup.find_all('tr')
+        tx_idx = -1
+        
+        # 尋找包含「臺股期貨」的那一個區塊
+        for i, row in enumerate(rows):
+            texts = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+            if '臺股期貨' in texts:
+                tx_idx = i
+                break
                 
-                # 台股期貨通常是表中的第一項商品，所以我們抓第一筆出現的「外資」
-                if '外資' in vals and len(vals) >= 12:
-                    # 避開前方合併儲存格的干擾，直接從陣列尾部往回數
-                    # 未平倉多方口數固定在倒數第 6 個，空方口數固定在倒數第 4 個
-                    long_pos = int(vals[-6].replace(',', ''))
-                    short_pos = int(vals[-4].replace(',', ''))
-                    net_pos = long_pos - short_pos
-                    return long_pos, short_pos, net_pos
-                    
-        # 如果真的沒抓到，回傳 0 以免您誤判
+        if tx_idx != -1:
+            # 臺股期貨的「外資」列固定在其下方第二列 (自營商 -> 投信 -> 外資)
+            foreign_row = rows[tx_idx + 2]
+            tds = foreign_row.find_all('td')
+            
+            # 確認該列確實是外資
+            if '外資' in tds[0].get_text(strip=True):
+                # 精準抓取：tds[7]未平倉多方, tds[9]未平倉空方, tds[11]淨未平倉
+                long_pos = int(tds[7].get_text(strip=True).replace(',', ''))
+                short_pos = int(tds[9].get_text(strip=True).replace(',', ''))
+                net_pos = int(tds[11].get_text(strip=True).replace(',', ''))
+                return long_pos, short_pos, net_pos
+                
         return 0, 0, 0
     except Exception as e:
         return 0, 0, 0

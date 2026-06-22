@@ -77,7 +77,7 @@ def fetch_5d_futures_data():
         
     return records[::-1]
 
-# 終極殺手鐧：直接呼叫期交所後端「CSV 下載 API」，完全跳過網頁表格解析！
+# 終極殺手鐧 + 強制過濾無效零口數合約
 @st.cache_data(ttl=3600)
 def fetch_top3_options_data():
     url = "https://www.taifex.com.tw/cht/3/optDataDown"
@@ -98,13 +98,11 @@ def fetch_top3_options_data():
                 }
                 res = requests.post(url, headers=headers, data=payload, timeout=5)
                 
-                # 嘗試解碼 (期交所 CSV 預設為 Big5)
                 try:
                     text_data = res.content.decode('big5')
                 except:
                     text_data = res.content.decode('utf-8', errors='ignore')
                     
-                # 確認是否成功抓到 CSV 表頭
                 if "交易日期" in text_data and "履約價" in text_data:
                     reader = csv.DictReader(StringIO(text_data))
                     for row in reader:
@@ -112,15 +110,19 @@ def fetch_top3_options_data():
                             strike, cp, oi = 0, '', 0
                             for k, v in row.items():
                                 if not k or not v: continue
-                                if '履約價' in k:
-                                    strike = int(float(v.strip()))
-                                elif '買賣權' in k:
-                                    cp = v.strip()
-                                elif '未平倉量' in k:
-                                    val = v.strip().replace(',', '')
-                                    oi = 0 if val == '-' else int(float(val))
+                                k_str = str(k).strip()
+                                v_str = str(v).strip()
+                                
+                                if '履約價' in k_str:
+                                    strike = int(float(v_str))
+                                elif '買賣權' in k_str:
+                                    cp = v_str
+                                elif '未平倉' in k_str:  # 用更寬鬆的關鍵字比對
+                                    val = v_str.replace(',', '')
+                                    oi = 0 if val == '-' or not val else int(float(val))
                                     
-                            if strike >= 10000:
+                            # 🔥 核心防護：只收錄有真實 OI 堆積 (大於 0) 的合約
+                            if strike >= 10000 and oi > 0:
                                 if '買' in cp or 'Call' in cp:
                                     calls.append((strike, oi))
                                 elif '賣' in cp or 'Put' in cp:
